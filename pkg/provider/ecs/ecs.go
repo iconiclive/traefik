@@ -6,6 +6,9 @@ import (
 	"strings"
 	"text/template"
 	"time"
+	"io/ioutil"
+	"os"
+	"encoding/json"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -22,22 +25,24 @@ import (
 	"github.com/traefik/traefik/v2/pkg/log"
 	"github.com/traefik/traefik/v2/pkg/provider"
 	"github.com/traefik/traefik/v2/pkg/safe"
+	"github.com/gofrs/flock"
 )
 
 // Provider holds configurations of the provider.
 type Provider struct {
 	Constraints      string `description:"Constraints is an expression that Traefik matches against the container's labels to determine whether to create any route for that container." json:"constraints,omitempty" toml:"constraints,omitempty" yaml:"constraints,omitempty" export:"true"`
-	ExposedByDefault bool   `description:"Expose services by default" json:"exposedByDefault,omitempty" toml:"exposedByDefault,omitempty" yaml:"exposedByDefault,omitempty" export:"true"`
-	RefreshSeconds   int    `description:"Polling interval (in seconds)" json:"refreshSeconds,omitempty" toml:"refreshSeconds,omitempty" yaml:"refreshSeconds,omitempty" export:"true"`
+	ExposedByDefault bool   `description:"Expose services by default." json:"exposedByDefault,omitempty" toml:"exposedByDefault,omitempty" yaml:"exposedByDefault,omitempty" export:"true"`
+	RefreshSeconds   int    `description:"Polling interval (in seconds)." json:"refreshSeconds,omitempty" toml:"refreshSeconds,omitempty" yaml:"refreshSeconds,omitempty" export:"true"`
 	DefaultRule      string `description:"Default rule." json:"defaultRule,omitempty" toml:"defaultRule,omitempty" yaml:"defaultRule,omitempty"`
 
 	// Provider lookup parameters.
-	Clusters             []string `description:"ECS Clusters name" json:"clusters,omitempty" toml:"clusters,omitempty" yaml:"clusters,omitempty" export:"true"`
-	AutoDiscoverClusters bool     `description:"Auto discover cluster" json:"autoDiscoverClusters,omitempty" toml:"autoDiscoverClusters,omitempty" yaml:"autoDiscoverClusters,omitempty" export:"true"`
-	ECSAnywhere          bool     `description:"Enable ECS Anywhere support" json:"ecsAnywhere,omitempty" toml:"ecsAnywhere,omitempty" yaml:"ecsAnywhere,omitempty" export:"true"`
-	Region               string   `description:"The AWS region to use for requests"  json:"region,omitempty" toml:"region,omitempty" yaml:"region,omitempty" export:"true"`
-	AccessKeyID          string   `description:"The AWS credentials access key to use for making requests" json:"accessKeyID,omitempty" toml:"accessKeyID,omitempty" yaml:"accessKeyID,omitempty" loggable:"false"`
-	SecretAccessKey      string   `description:"The AWS credentials access key to use for making requests" json:"secretAccessKey,omitempty" toml:"secretAccessKey,omitempty" yaml:"secretAccessKey,omitempty" loggable:"false"`
+	Clusters             []string `description:"ECS Cluster names." json:"clusters,omitempty" toml:"clusters,omitempty" yaml:"clusters,omitempty" export:"true"`
+	AutoDiscoverClusters bool     `description:"Auto discover cluster." json:"autoDiscoverClusters,omitempty" toml:"autoDiscoverClusters,omitempty" yaml:"autoDiscoverClusters,omitempty" export:"true"`
+	HealthyTasksOnly     bool     `description:"Determines whether to discover only healthy tasks." json:"healthyTasksOnly,omitempty" toml:"healthyTasksOnly,omitempty" yaml:"healthyTasksOnly,omitempty" export:"true"`
+	ECSAnywhere          bool     `description:"Enable ECS Anywhere support." json:"ecsAnywhere,omitempty" toml:"ecsAnywhere,omitempty" yaml:"ecsAnywhere,omitempty" export:"true"`
+	Region               string   `description:"AWS region to use for requests."  json:"region,omitempty" toml:"region,omitempty" yaml:"region,omitempty" export:"true"`
+	AccessKeyID          string   `description:"AWS credentials access key ID to use for making requests." json:"accessKeyID,omitempty" toml:"accessKeyID,omitempty" yaml:"accessKeyID,omitempty" loggable:"false"`
+	SecretAccessKey      string   `description:"AWS credentials access key to use for making requests." json:"secretAccessKey,omitempty" toml:"secretAccessKey,omitempty" yaml:"secretAccessKey,omitempty" loggable:"false"`
 	defaultRuleTpl       *template.Template
 }
 
@@ -50,10 +55,84 @@ type ecsInstance struct {
 	ExtraConf           configuration
 }
 
+func (e ecsInstance) MarshalJSON() ([]byte, error) {
+	type Alias ecsInstance
+
+	return json.Marshal(&struct {
+		ContainerDefinition *ecs.ContainerDefinition `json:"containerDefinition"`
+		Machine             *machine                 `json:"machine"`
+		*Alias
+	}{
+		ContainerDefinition: e.containerDefinition,
+		Machine:             e.machine,
+		Alias:               (*Alias)(&e),
+	})
+}
+
+func (e *ecsInstance) UnmarshalJSON(data []byte) error {
+	type Alias ecsInstance
+
+	aux := &struct {
+		ContainerDefinition json.RawMessage `json:"containerDefinition"`
+		Machine             json.RawMessage `json:"machine"`
+		*Alias
+	}{
+		Alias: (*Alias)(e),
+	}
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	var containerDefinition ecs.ContainerDefinition
+	if err := json.Unmarshal(aux.ContainerDefinition, &containerDefinition); err != nil {
+		return err
+	}
+	e.containerDefinition = &containerDefinition
+
+	var machine machine
+	if err := json.Unmarshal(aux.Machine, &machine); err != nil {
+		return err
+	}
+	e.machine = &machine
+
+	return nil
+}
+
 type portMapping struct {
 	containerPort int64
 	hostPort      int64
 	protocol      string
+}
+
+func (p portMapping) MarshalJSON() ([]byte, error) {
+	return json.Marshal(&struct {
+		ContainerPort int64  `json:"containerPort"`
+		HostPort      int64  `json:"hostPort"`
+		Protocol      string `json:"protocol"`
+	}{
+		ContainerPort: p.containerPort,
+		HostPort:      p.hostPort,
+		Protocol:      p.protocol,
+	})
+}
+
+func (p *portMapping) UnmarshalJSON(data []byte) error {
+	aux := &struct {
+		ContainerPort int64  `json:"containerPort"`
+		HostPort      int64  `json:"hostPort"`
+		Protocol      string `json:"protocol"`
+	}{}
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	p.containerPort = aux.ContainerPort
+	p.hostPort = aux.HostPort
+	p.protocol = aux.Protocol
+
+	return nil
 }
 
 type machine struct {
@@ -61,6 +140,53 @@ type machine struct {
 	privateIP    string
 	ports        []portMapping
 	healthStatus string
+}
+
+func (m machine) MarshalJSON() ([]byte, error) {
+	type Alias machine
+
+	return json.Marshal(&struct {
+		State        string        `json:"state"`
+		PrivateIP    string        `json:"privateIP"`
+		Ports        []portMapping `json:"ports"`
+		HealthStatus string        `json:"healthStatus"`
+		*Alias
+	}{
+		State:        m.state,
+		PrivateIP:    m.privateIP,
+		Ports:        m.ports,
+		HealthStatus: m.healthStatus,
+		Alias:        (*Alias)(&m),
+	})
+}
+
+func (m *machine) UnmarshalJSON(data []byte) error {
+	type Alias machine
+
+	aux := &struct {
+		State        string        `json:"state"`
+		PrivateIP    string        `json:"privateIP"`
+		Ports        []portMapping `json:"ports"`
+		HealthStatus string        `json:"healthStatus"`
+		*Alias
+	}{
+		Alias: (*Alias)(m),
+	}
+
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	m.state = aux.State
+	m.privateIP = aux.PrivateIP
+	if aux.Ports != nil {
+		m.ports = aux.Ports
+	} else {
+		m.ports = []portMapping{}
+	}
+	m.healthStatus = aux.HealthStatus
+
+	return nil
 }
 
 type awsClient struct {
@@ -81,6 +207,7 @@ var (
 func (p *Provider) SetDefaults() {
 	p.Clusters = []string{"default"}
 	p.AutoDiscoverClusters = false
+	p.HealthyTasksOnly = false
 	p.ExposedByDefault = true
 	p.RefreshSeconds = 15
 	p.DefaultRule = DefaultTemplateRule
@@ -193,14 +320,35 @@ func (p *Provider) Provide(configurationChan chan<- dynamic.Message, pool *safe.
 }
 
 func (p *Provider) loadConfiguration(ctx context.Context, client *awsClient, configurationChan chan<- dynamic.Message) error {
+	logger := log.FromContext(ctx)
+
 	instances, err := p.listInstances(ctx, client)
 	if err != nil {
-		return err
+		fmt.Errorf("unable to get configuration from ECS: %w", err)
 	}
+	
+	if instances != nil {
+		logger.Debugf("using configuration from ECS service discovery")
+		configurationChan <- dynamic.Message{
+			ProviderName:  "ecs",
+			Configuration: p.buildConfiguration(ctx, instances),
+		}
 
-	configurationChan <- dynamic.Message{
-		ProviderName:  "ecs",
-		Configuration: p.buildConfiguration(ctx, instances),
+		logger.Debugf("writing to disk cache")
+		if err := p.writeCacheFile(instances); err != nil {
+			fmt.Errorf("writing cache file: %w", err)
+		}
+	} else {
+		logger.Debugf("reading from disk cache")
+		cachedInstances, err := p.readCacheFile()
+		if err != nil {
+			return fmt.Errorf("reading cache file: %w", err)
+		}
+		logger.Debugf("using cached ECS configuration from disk")
+		configurationChan <- dynamic.Message{
+			ProviderName:  "ecs",
+			Configuration: p.buildConfiguration(ctx, cachedInstances),
+		}
 	}
 
 	return nil
@@ -258,9 +406,12 @@ func (p *Provider) listInstances(ctx context.Context, client *awsClient) ([]ecsI
 					logger.Errorf("Unable to describe tasks for %v", page.TaskArns)
 				} else {
 					for _, t := range resp.Tasks {
-						if aws.StringValue(t.LastStatus) == ecs.DesiredStatusRunning {
-							tasks[aws.StringValue(t.TaskArn)] = t
+						if p.HealthyTasksOnly && aws.StringValue(t.HealthStatus) != ecs.HealthStatusHealthy {
+							logger.Debugf("Skipping unhealthy task %s", aws.StringValue(t.TaskArn))
+							continue
 						}
+
+						tasks[aws.StringValue(t.TaskArn)] = t
 					}
 				}
 			}
@@ -315,11 +466,6 @@ func (p *Provider) listInstances(ctx context.Context, client *awsClient) ([]ecsI
 
 				var mach *machine
 				if len(task.Attachments) != 0 {
-					if len(container.NetworkInterfaces) == 0 {
-						logger.Errorf("Skip container %s: no network interfaces", aws.StringValue(container.Name))
-						continue
-					}
-
 					var ports []portMapping
 					for _, mapping := range containerDefinition.PortMappings {
 						if mapping != nil {
@@ -383,7 +529,7 @@ func (p *Provider) listInstances(ctx context.Context, client *awsClient) ([]ecsI
 
 				extraConf, err := p.getConfiguration(instance)
 				if err != nil {
-					logger.Errorf("Skip container %s: %w", getServiceName(instance), err)
+					log.FromContext(ctx).Errorf("Skip container %s: %w", getServiceName(instance), err)
 					continue
 				}
 				instance.ExtraConf = extraConf
@@ -561,4 +707,59 @@ func (p *Provider) chunkIDs(ids []*string) [][]*string {
 		chunked = append(chunked, ids[i:sliceEnd])
 	}
 	return chunked
+}
+
+func (p *Provider) readCacheFile() ([]ecsInstance, error) {
+	filePath := "/tmp/traefik/ecs.cache.json"
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("error opening cache file: %w", err)
+	}
+	defer f.Close()
+
+	content, err := ioutil.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("error reading cache file: %w", err)
+	}
+
+	var instances []ecsInstance
+	err = json.Unmarshal(content, &instances)
+	if err != nil {
+		return nil, fmt.Errorf("error decoding cache file: %w", err)
+	}
+
+	return instances, nil
+}
+
+func (p *Provider) writeCacheFile(instances []ecsInstance) error {
+	filePath := "/tmp/traefik/ecs.cache.json"
+	fileLock := flock.New(filePath + ".lock")
+
+	locked, err := fileLock.TryLock()
+	if err != nil {
+		return fmt.Errorf("lock not possible on cache file: %w", err)
+	}
+
+	if locked {
+		defer fileLock.Unlock()
+			
+		jsonData, err := json.Marshal(instances)
+		if err != nil {
+			return fmt.Errorf("error marshalling json cache: %w", err)
+		}
+
+		file, err := os.Create(filePath)
+		if err != nil {
+			return fmt.Errorf("Error creating file:", err)
+		}
+		defer file.Close()
+
+		_, err = file.Write(jsonData)
+		if err != nil {
+			return fmt.Errorf("Error writing JSON data to file:", err)
+		}
+	}
+
+	return nil
 }
